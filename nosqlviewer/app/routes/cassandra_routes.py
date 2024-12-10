@@ -1,4 +1,5 @@
-from flask import  Blueprint, jsonify, request
+from datetime import datetime
+from flask import Blueprint, jsonify, request
 from flask_jwt_extended import create_access_token
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3
@@ -8,6 +9,7 @@ import os
 cassandra_routes = Blueprint('cassandra_routes', __name__)
 
 DB_FILE = 'nosql_viewer.db'
+
 
 def init_databases():
     conn = sqlite3.connect(DB_FILE)
@@ -70,9 +72,20 @@ def init_databases():
             FROM columns
         ''')
 
+    # Create update_logs table
+    cursor.execute('''
+                CREATE TABLE IF NOT EXISTS update_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_name TEXT,
+                    timestamp TEXT,
+                    existing_data TEXT,
+                    updated_data TEXT
+                )
+            ''')
 
     conn.commit()
     conn.close()
+
 
 init_databases()
 
@@ -109,7 +122,10 @@ def upload_file():
         # Save the uploaded file temporarily
         uploads_dir = os.path.join(os.getcwd(), 'uploads')
         os.makedirs(uploads_dir, exist_ok=True)
-        file_path = os.path.join(uploads_dir, file.filename)
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S_%f')
+        file_extension = os.path.splitext(file.filename)[1]
+        filename = f"{timestamp}{file_extension}"
+        file_path = os.path.join(uploads_dir, filename)
         file.save(file_path)
 
         # Process the CSV file
@@ -130,7 +146,6 @@ def upload_file():
 def process_csv_data(csv_data):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-
     # Ensure the `columns` table exists
     try:
         cursor.execute('''
@@ -154,9 +169,9 @@ def process_csv_data(csv_data):
         conn.close()
         return
 
-    # Fetch existing records from DB
+    # Fetch existing records from sqliteDB
     cursor.execute('SELECT keyspace_name, table_name, column_name, clustering_order, column_name_bytes, kind, '
-                   'position, type, tag, note, status FROM columns')
+                   'position, type, note, tag, status FROM columns')
     db_rows = cursor.fetchall()
     db_data = {f"{row[0]}.{row[1]}.{row[2]}": row for row in db_rows}
 
@@ -169,7 +184,11 @@ def process_csv_data(csv_data):
             clustering_order = row.get('clustering_order', '').strip()
             column_name_bytes = row.get('column_name_bytes', '').strip()
             kind = row.get('kind', '').strip()
-            position = row.get('position', '').strip()
+            position = row.get('position', '')
+            try:
+                position = int(position)
+            except (ValueError, TypeError):
+                position = 0
             type = row.get('type', '').strip()
             note = row.get('note', 'no note').strip() or 'no note'
             tag = row.get('tag', 'no tags').strip() or 'no tags'
@@ -186,10 +205,13 @@ def process_csv_data(csv_data):
                         column_name_bytes != db_row[4] or
                         kind != db_row[5] or
                         position != db_row[6] or
-                        type !=  db_row[7] or
+                        type != db_row[7] or
                         note != db_row[8] or
                         tag != db_row[9] or
                         status != db_row[10]):
+                    existing_data = str(db_row)
+                    updated_data = str((keyspace_name, table_name, column_name, clustering_order, column_name_bytes,
+                                        kind, position, type, note, tag, 'active'))
                     cursor.execute('''
                         UPDATE columns
                         SET clustering_order = ?, column_name_bytes = ?, kind = ?, position = ?, type = ?, note = ?, 
@@ -197,13 +219,30 @@ def process_csv_data(csv_data):
                         WHERE keyspace_name = ? AND table_name = ? AND column_name = ?
                     ''', (clustering_order, column_name_bytes, kind, position, type, note, tag, keyspace_name,
                           table_name, column_name))
+                    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    cursor.execute(''' 
+                                        INSERT INTO update_logs (user_name, timestamp, existing_data, updated_data)
+                                        VALUES ('admin', ?, ?, ?)
+                                    ''', (timestamp, existing_data, updated_data))
+
             else:
+                existing_data = "None"
+                updated_data = str((keyspace_name, table_name, column_name, clustering_order, column_name_bytes,
+                                    kind, position, type, note, tag, 'active'))
+                # Insert the new row into the columns table
                 cursor.execute('''
                     INSERT INTO columns (keyspace_name, table_name, column_name, clustering_order, column_name_bytes, 
                     kind, position,type, note, tag, status)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
                 ''', (keyspace_name, table_name, column_name, clustering_order, column_name_bytes,
-                    kind, position, type, note, tag))
+                      kind, position, type, note, tag))
+
+                # Log the insertion in the update_logs table
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute(''' 
+                                INSERT INTO update_logs (user_name, timestamp, existing_data, updated_data)
+                                VALUES ('admin', ?, ?, ?)
+                            ''', (timestamp, existing_data, updated_data))
         except Exception as e:
             print(f"Error processing row: {row}, Error: {str(e)}")
             continue
@@ -216,6 +255,13 @@ def process_csv_data(csv_data):
                 SET status = 'deleted'
                 WHERE keyspace_name = ? AND table_name = ? AND column_name = ?
             ''', (db_row[0], db_row[1], db_row[2]))
+            existing_data = str(db_row)
+            updated_data = "none"
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute(''' 
+            INSERT INTO update_logs (user_name, timestamp, existing_data, updated_data)
+            VALUES ('admin', ?, ?, ?)
+            ''', (timestamp, existing_data, updated_data))
 
     conn.commit()
     conn.close()
@@ -254,6 +300,7 @@ def get_distinct_table_names():
         print(f"Error retrieving table names: {e}")
         return jsonify({"error": "Failed to retrieve table names"}), 500
 
+
 @cassandra_routes.route('/api/get_columns', methods=['GET'])
 def get_distinct_columns():
     keyspace_name = request.args.get('keyspace_name')
@@ -282,9 +329,9 @@ def update_column():
     keyspace_name = data.get('keyspace_name')
     table_name = data.get('table_name')
     column_name = data.get('column_name')
-    tag = data.get('tag')
     note = data.get('note')
-    if not all([keyspace_name, table_name, column_name, tag, note]):
+    tag = data.get('tag')
+    if not all([keyspace_name, table_name, column_name, note, tag]):
         return jsonify({"error": "keyspace_name, table_name, column_name, tag, and note are required"}), 400
     try:
         check_query = """
@@ -310,6 +357,7 @@ def update_column():
     except Exception as e:
         # Handle unexpected errors
         return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
+
 
 @cassandra_routes.route('/api/get_table_description', methods=['GET'])
 def get_table_description():
@@ -411,7 +459,6 @@ def get_filter_data():
         return jsonify({"error": str(e)}), 500
 
 
-
 @cassandra_routes.route('/api/save_relation', methods=['POST'])
 def save_relation():
     try:
@@ -419,7 +466,8 @@ def save_relation():
         data = request.get_json()
 
         # Validate all required fields are present
-        required_fields = ['from_keyspace', 'from_table', 'from_column', 'to_keyspace', 'to_table', 'to_column', 'is_published']
+        required_fields = ['from_keyspace', 'from_table', 'from_column', 'to_keyspace', 'to_table', 'to_column',
+                           'is_published']
         if not all(field in data for field in required_fields):
             return jsonify({'error': 'Missing required fields'}), 400
 
@@ -484,6 +532,7 @@ def get_relations():
     except Exception as e:
         return jsonify({'error': f'An unexpected error occurred: {e}'}), 500
 
+
 @cassandra_routes.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -499,7 +548,8 @@ def login():
     if not check_password_hash(stored_password, password):
         return jsonify({"msg": "Invalid email or password"}), 401
     access_token = create_access_token(identity=email)
-    return jsonify(success = True, access_token=access_token), 200
+    return jsonify(success=True, access_token=access_token), 200
+
 
 @cassandra_routes.route('/api/register', methods=['POST'])
 def register():
@@ -514,12 +564,3 @@ def register():
     query = "INSERT INTO users (user_name, password) VALUES (?, ?)"
     query_database(query, (email, hashed_password), fetchall=False)
     return jsonify({"msg": "User created successfully"}), 201
-
-
-
-
-
-
-
-
-
