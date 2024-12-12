@@ -564,3 +564,34 @@ def register():
     query = "INSERT INTO users (user_name, password) VALUES (?, ?)"
     query_database(query, (email, hashed_password), fetchall=False)
     return jsonify({"msg": "User created successfully"}), 201
+
+@cassandra_routes.route( '/api/db_data',methods=['GET'])
+def get_all_db_data():
+    table_name = request.args.get('table_name')
+    if not table_name:
+        return jsonify({"error": "Table name is required"}), 400
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+        if not cursor.fetchone():
+            return jsonify({"error": f"Table '{table_name}' does not exist"}), 404
+        query = f"SELECT * FROM {table_name}"
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+        data = [dict(zip(columns, row)) for row in rows]
+        return jsonify({"table": table_name, "data": data}), 200
+    except sqlite3.Error as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+
+
+
+
+
+
